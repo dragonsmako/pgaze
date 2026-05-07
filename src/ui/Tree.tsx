@@ -1,16 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
+import TextInput from 'ink-text-input';
 import Spinner from 'ink-spinner';
-import type { ColumnInfo, TableInfo } from '../types.js';
+import type { ColumnInfo, RoutineInfo, TableInfo } from '../types.js';
 import type { Connection } from '../db/client.js';
-import { listColumns, listSchemas, listTables } from '../db/introspect.js';
+import {
+  listAllObjects,
+  listColumns,
+  listRoutines,
+  listSchemas,
+  listTables,
+  listViews,
+  type AllObject,
+} from '../db/introspect.js';
 
-type SchemaNode = {
-  name: string;
-  expanded: boolean;
-  loading: boolean;
-  tables?: TableNode[];
-  error?: string;
+type SectionKind = 'tables' | 'views' | 'functions';
+
+const SECTION_LABELS: Record<SectionKind, string> = {
+  tables: 'Tables',
+  views: 'Views',
+  functions: 'Functions',
 };
 
 type TableNode = {
@@ -22,14 +31,34 @@ type TableNode = {
   error?: string;
 };
 
+type RoutineNode = RoutineInfo;
+
+type SectionState = {
+  kind: SectionKind;
+  expanded: boolean;
+  loading: boolean;
+  error?: string;
+  tables?: TableNode[];
+  routines?: RoutineNode[];
+};
+
+type SchemaNode = {
+  name: string;
+  expanded: boolean;
+  sections: SectionState[];
+};
+
 type FlatItem =
   | { kind: 'schema'; depth: 0; schema: SchemaNode }
-  | { kind: 'schema-loading'; depth: 1; schema: SchemaNode }
-  | { kind: 'schema-error'; depth: 1; schema: SchemaNode }
-  | { kind: 'table'; depth: 1; schema: SchemaNode; table: TableNode }
-  | { kind: 'table-loading'; depth: 2; schema: SchemaNode; table: TableNode }
-  | { kind: 'table-error'; depth: 2; schema: SchemaNode; table: TableNode }
-  | { kind: 'column'; depth: 2; schema: SchemaNode; table: TableNode; column: ColumnInfo };
+  | { kind: 'section'; depth: 1; schema: SchemaNode; section: SectionState }
+  | { kind: 'section-loading'; depth: 2; schema: SchemaNode; section: SectionState }
+  | { kind: 'section-error'; depth: 2; schema: SchemaNode; section: SectionState }
+  | { kind: 'section-empty'; depth: 2; schema: SchemaNode; section: SectionState }
+  | { kind: 'table'; depth: 2; schema: SchemaNode; section: SectionState; table: TableNode }
+  | { kind: 'table-loading'; depth: 3; schema: SchemaNode; table: TableNode }
+  | { kind: 'table-error'; depth: 3; schema: SchemaNode; table: TableNode }
+  | { kind: 'column'; depth: 3; schema: SchemaNode; table: TableNode; column: ColumnInfo }
+  | { kind: 'function'; depth: 2; schema: SchemaNode; routine: RoutineNode };
 
 type Props = {
   conn: Connection;
@@ -37,6 +66,8 @@ type Props = {
   maxCols: number;
   maxRows: number;
   onSelectTable: (schema: string, table: string) => void;
+  onSelectFunction: (sql: string) => void;
+  onSearchingChange?: (searching: boolean) => void;
 };
 
 function truncate(s: string, width: number): string {
@@ -46,12 +77,60 @@ function truncate(s: string, width: number): string {
   return s.slice(0, width - 1) + '…';
 }
 
-export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelectTable }) => {
+function quoteIdent(name: string): string {
+  return '"' + name.replace(/"/g, '""') + '"';
+}
+
+function buildFunctionTemplate(
+  schema: string,
+  name: string,
+  prokind: string | undefined,
+  args?: string,
+): string {
+  const qualified = `${quoteIdent(schema)}.${quoteIdent(name)}`;
+  const argList = args && args.trim().length > 0 ? `/* ${args} */` : '';
+  if (prokind === 'p') {
+    return `CALL ${qualified}(${argList});`;
+  }
+  return `SELECT * FROM ${qualified}(${argList});`;
+}
+
+function makeSchema(name: string): SchemaNode {
+  return {
+    name,
+    expanded: false,
+    sections: [
+      { kind: 'tables', expanded: false, loading: false },
+      { kind: 'views', expanded: false, loading: false },
+      { kind: 'functions', expanded: false, loading: false },
+    ],
+  };
+}
+
+export const Tree: React.FC<Props> = ({
+  conn,
+  focused,
+  maxCols,
+  maxRows,
+  onSelectTable,
+  onSelectFunction,
+  onSearchingChange,
+}) => {
   const [schemas, setSchemas] = useState<SchemaNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [topError, setTopError] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
   const [scroll, setScroll] = useState(0);
+
+  const [searchMode, setSearchMode] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [allObjects, setAllObjects] = useState<AllObject[] | null>(null);
+  const [allObjectsLoading, setAllObjectsLoading] = useState(false);
+  const [allObjectsError, setAllObjectsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    onSearchingChange?.(searchMode);
+  }, [searchMode, onSearchingChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,9 +138,7 @@ export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelec
     listSchemas(conn)
       .then((names) => {
         if (cancelled) return;
-        setSchemas(
-          names.map((n) => ({ name: n, expanded: false, loading: false })),
-        );
+        setSchemas(names.map(makeSchema));
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -74,132 +151,306 @@ export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelec
     };
   }, [conn]);
 
-  const flat: FlatItem[] = [];
-  schemas.forEach((schema) => {
-    flat.push({ kind: 'schema', depth: 0, schema });
-    if (schema.expanded) {
-      if (schema.loading) {
-        flat.push({ kind: 'schema-loading', depth: 1, schema });
-      } else if (schema.error) {
-        flat.push({ kind: 'schema-error', depth: 1, schema });
-      } else if (schema.tables) {
-        schema.tables.forEach((table) => {
-          flat.push({ kind: 'table', depth: 1, schema, table });
-          if (table.expanded) {
-            if (table.loading) {
-              flat.push({ kind: 'table-loading', depth: 2, schema, table });
-            } else if (table.error) {
-              flat.push({ kind: 'table-error', depth: 2, schema, table });
-            } else if (table.columns) {
-              table.columns.forEach((column) => {
-                flat.push({ kind: 'column', depth: 2, schema, table, column });
-              });
-            }
+  // ─────────────── flat list ───────────────
+  let flat: FlatItem[] = [];
+  let searchResults: AllObject[] = [];
+
+  if (searchMode) {
+    const q = searchQuery.trim().toLowerCase();
+    const source = allObjects ?? [];
+    searchResults =
+      q.length === 0
+        ? source.slice(0, 200)
+        : source.filter((o) =>
+            (o.schema + '.' + o.name).toLowerCase().includes(q),
+          );
+  } else {
+    schemas.forEach((schema) => {
+      flat.push({ kind: 'schema', depth: 0, schema });
+      if (!schema.expanded) return;
+      schema.sections.forEach((section) => {
+        flat.push({ kind: 'section', depth: 1, schema, section });
+        if (!section.expanded) return;
+        if (section.loading) {
+          flat.push({ kind: 'section-loading', depth: 2, schema, section });
+          return;
+        }
+        if (section.error) {
+          flat.push({ kind: 'section-error', depth: 2, schema, section });
+          return;
+        }
+        if (section.kind === 'functions') {
+          const items = section.routines ?? [];
+          if (items.length === 0) {
+            flat.push({ kind: 'section-empty', depth: 2, schema, section });
+            return;
           }
-        });
-      }
-    }
-  });
+          items.forEach((routine) => {
+            flat.push({ kind: 'function', depth: 2, schema, routine });
+          });
+        } else {
+          const items = section.tables ?? [];
+          if (items.length === 0) {
+            flat.push({ kind: 'section-empty', depth: 2, schema, section });
+            return;
+          }
+          items.forEach((table) => {
+            flat.push({ kind: 'table', depth: 2, schema, section, table });
+            if (!table.expanded) return;
+            if (table.loading) {
+              flat.push({ kind: 'table-loading', depth: 3, schema, table });
+              return;
+            }
+            if (table.error) {
+              flat.push({ kind: 'table-error', depth: 3, schema, table });
+              return;
+            }
+            (table.columns ?? []).forEach((column) => {
+              flat.push({ kind: 'column', depth: 3, schema, table, column });
+            });
+          });
+        }
+      });
+    });
+  }
 
-  const safeCursor = flat.length === 0 ? 0 : Math.min(cursor, flat.length - 1);
+  const total = searchMode ? searchResults.length : flat.length;
+  const safeCursor = total === 0 ? 0 : Math.min(cursor, total - 1);
+  const headerRows = searchMode ? 3 : 2;
+  const viewport = Math.max(1, maxRows - headerRows - 2);
+  const safeScroll = Math.max(0, Math.min(scroll, Math.max(0, total - viewport)));
 
-  // header (1) + optional ▲ (1) + optional ▼ (1) + items
-  const headerRows = 2; // "Schemas" + blank line
-  const viewport = Math.max(1, maxRows - headerRows - 2); // -2 for indicator rows
-  const safeScroll = Math.max(
-    0,
-    Math.min(scroll, Math.max(0, flat.length - viewport)),
-  );
-
-  // keep cursor in view
   useEffect(() => {
     setScroll((prev) => {
       let next = prev;
       if (safeCursor < next) next = safeCursor;
       else if (safeCursor >= next + viewport) next = safeCursor - viewport + 1;
-      const max = Math.max(0, flat.length - viewport);
+      const max = Math.max(0, total - viewport);
       if (next > max) next = max;
       if (next < 0) next = 0;
       return next;
     });
-  }, [safeCursor, viewport, flat.length]);
+  }, [safeCursor, viewport, total]);
 
-  const visible = flat.slice(safeScroll, safeScroll + viewport);
-  const hasAbove = safeScroll > 0;
-  const hasBelow = safeScroll + viewport < flat.length;
-
-  function updateSchema(name: string, patch: Partial<SchemaNode>): void {
-    setSchemas((prev) =>
-      prev.map((s) => (s.name === name ? { ...s, ...patch } : s)),
-    );
+  // ─────────────── mutators ───────────────
+  function patchSchema(name: string, fn: (s: SchemaNode) => SchemaNode): void {
+    setSchemas((prev) => prev.map((s) => (s.name === name ? fn(s) : s)));
   }
 
-  function updateTable(schemaName: string, tableName: string, patch: Partial<TableNode>): void {
-    setSchemas((prev) =>
-      prev.map((s) => {
-        if (s.name !== schemaName || !s.tables) return s;
-        return {
-          ...s,
-          tables: s.tables.map((t) => (t.name === tableName ? { ...t, ...patch } : t)),
-        };
-      }),
-    );
+  function patchSection(
+    schemaName: string,
+    sectionKind: SectionKind,
+    fn: (s: SectionState) => SectionState,
+  ): void {
+    patchSchema(schemaName, (schema) => ({
+      ...schema,
+      sections: schema.sections.map((sec) => (sec.kind === sectionKind ? fn(sec) : sec)),
+    }));
   }
 
-  async function expandSchema(schema: SchemaNode): Promise<void> {
-    if (schema.tables) {
-      updateSchema(schema.name, { expanded: true });
-      return;
-    }
-    updateSchema(schema.name, { expanded: true, loading: true, error: undefined });
+  function patchTable(
+    schemaName: string,
+    sectionKind: SectionKind,
+    tableName: string,
+    fn: (t: TableNode) => TableNode,
+  ): void {
+    patchSection(schemaName, sectionKind, (section) => ({
+      ...section,
+      tables: (section.tables ?? []).map((t) => (t.name === tableName ? fn(t) : t)),
+    }));
+  }
+
+  async function loadSection(schemaName: string, section: SectionState): Promise<void> {
+    patchSection(schemaName, section.kind, (s) => ({
+      ...s,
+      loading: true,
+      error: undefined,
+    }));
     try {
-      const tables = await listTables(conn, schema.name);
-      updateSchema(schema.name, {
-        loading: false,
-        tables: tables.map((t) => ({
-          name: t.name,
-          kind: t.kind,
-          expanded: false,
+      if (section.kind === 'tables') {
+        const tables = await listTables(conn, schemaName);
+        patchSection(schemaName, 'tables', (s) => ({
+          ...s,
           loading: false,
-        })),
-      });
+          tables: tables.map((t) => ({ ...t, expanded: false, loading: false })),
+        }));
+      } else if (section.kind === 'views') {
+        const views = await listViews(conn, schemaName);
+        patchSection(schemaName, 'views', (s) => ({
+          ...s,
+          loading: false,
+          tables: views.map((t) => ({ ...t, expanded: false, loading: false })),
+        }));
+      } else {
+        const routines = await listRoutines(conn, schemaName);
+        patchSection(schemaName, 'functions', (s) => ({
+          ...s,
+          loading: false,
+          routines,
+        }));
+      }
     } catch (err) {
-      updateSchema(schema.name, {
-        loading: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      const msg = err instanceof Error ? err.message : String(err);
+      patchSection(schemaName, section.kind, (s) => ({ ...s, loading: false, error: msg }));
     }
   }
 
-  async function expandTable(schemaName: string, table: TableNode): Promise<void> {
+  async function expandSection(schema: SchemaNode, section: SectionState): Promise<void> {
+    patchSection(schema.name, section.kind, (s) => ({ ...s, expanded: true }));
+    const alreadyLoaded =
+      (section.kind === 'functions' && section.routines !== undefined) ||
+      (section.kind !== 'functions' && section.tables !== undefined);
+    if (!alreadyLoaded && !section.loading) {
+      await loadSection(schema.name, section);
+    }
+  }
+
+  async function expandTable(
+    schemaName: string,
+    sectionKind: SectionKind,
+    table: TableNode,
+  ): Promise<void> {
     if (table.columns) {
-      updateTable(schemaName, table.name, { expanded: true });
+      patchTable(schemaName, sectionKind, table.name, (t) => ({ ...t, expanded: true }));
       return;
     }
-    updateTable(schemaName, table.name, { expanded: true, loading: true, error: undefined });
+    patchTable(schemaName, sectionKind, table.name, (t) => ({
+      ...t,
+      expanded: true,
+      loading: true,
+      error: undefined,
+    }));
     try {
       const columns = await listColumns(conn, schemaName, table.name);
-      updateTable(schemaName, table.name, { loading: false, columns });
-    } catch (err) {
-      updateTable(schemaName, table.name, {
+      patchTable(schemaName, sectionKind, table.name, (t) => ({
+        ...t,
         loading: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
+        columns,
+      }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      patchTable(schemaName, sectionKind, table.name, (t) => ({
+        ...t,
+        loading: false,
+        error: msg,
+      }));
     }
   }
 
-  const current = flat[safeCursor];
+  // ─────────────── search ───────────────
+  async function enterSearchMode(): Promise<void> {
+    setSearchMode(true);
+    setSearchQuery('');
+    setCursor(0);
+    setScroll(0);
+    if (allObjects === null && !allObjectsLoading) {
+      setAllObjectsLoading(true);
+      setAllObjectsError(null);
+      try {
+        const list = await listAllObjects(conn);
+        setAllObjects(list);
+      } catch (err) {
+        setAllObjectsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAllObjectsLoading(false);
+      }
+    }
+  }
+
+  function exitSearchMode(): void {
+    setSearchMode(false);
+    setSearchQuery('');
+    setCursor(0);
+    setScroll(0);
+  }
+
+  function activateSearchResult(): void {
+    const r = searchResults[safeCursor];
+    if (!r) return;
+    if (r.category === 'function') {
+      onSelectFunction(buildFunctionTemplate(r.schema, r.name, r.prokind, ''));
+    } else {
+      onSelectTable(r.schema, r.name);
+    }
+    exitSearchMode();
+  }
+
+  // ─────────────── ctrl-arrow jumps ───────────────
+  function jumpToSibling(direction: 1 | -1): void {
+    if (searchMode) return;
+    if (flat.length === 0) return;
+    const currentDepth = flat[safeCursor]?.depth ?? 0;
+    if (direction === 1) {
+      for (let i = safeCursor + 1; i < flat.length; i++) {
+        if ((flat[i]?.depth ?? 0) <= currentDepth) {
+          setCursor(i);
+          return;
+        }
+      }
+      setCursor(flat.length - 1);
+    } else {
+      for (let i = safeCursor - 1; i >= 0; i--) {
+        if ((flat[i]?.depth ?? 0) <= currentDepth) {
+          setCursor(i);
+          return;
+        }
+      }
+      setCursor(0);
+    }
+  }
+
+  // ─────────────── input ───────────────
+  const currentItem = !searchMode ? flat[safeCursor] : null;
 
   useInput(
-    (_input, key) => {
-      if (flat.length === 0) return;
+    (input, key) => {
+      if (!focused) return;
 
+      if (searchMode) {
+        if (key.escape) {
+          exitSearchMode();
+          return;
+        }
+        if (key.upArrow) {
+          setCursor((c) => Math.max(0, c - 1));
+          return;
+        }
+        if (key.downArrow) {
+          setCursor((c) => Math.min(Math.max(0, searchResults.length - 1), c + 1));
+          return;
+        }
+        if (key.pageUp) {
+          setCursor((c) => Math.max(0, c - viewport));
+          return;
+        }
+        if (key.pageDown) {
+          setCursor((c) => Math.min(Math.max(0, searchResults.length - 1), c + viewport));
+          return;
+        }
+        return;
+      }
+
+      if (input === '/' && !key.ctrl && !key.meta) {
+        void enterSearchMode();
+        return;
+      }
+
+      if (total === 0) return;
+
+      if (key.ctrl && key.upArrow) {
+        jumpToSibling(-1);
+        return;
+      }
+      if (key.ctrl && key.downArrow) {
+        jumpToSibling(1);
+        return;
+      }
       if (key.upArrow) {
         setCursor((c) => Math.max(0, c - 1));
         return;
       }
       if (key.downArrow) {
-        setCursor((c) => Math.min(flat.length - 1, c + 1));
+        setCursor((c) => Math.min(total - 1, c + 1));
         return;
       }
       if (key.pageUp) {
@@ -207,50 +458,77 @@ export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelec
         return;
       }
       if (key.pageDown) {
-        setCursor((c) => Math.min(flat.length - 1, c + viewport));
+        setCursor((c) => Math.min(total - 1, c + viewport));
         return;
       }
 
-      if (!current) return;
+      if (!currentItem) return;
 
       if (key.return) {
-        if (current.kind === 'schema') {
-          if (current.schema.expanded) {
-            updateSchema(current.schema.name, { expanded: false });
-          } else {
-            void expandSchema(current.schema);
-          }
-        } else if (current.kind === 'table') {
-          onSelectTable(current.schema.name, current.table.name);
-        } else if (current.kind === 'column') {
-          onSelectTable(current.schema.name, current.table.name);
-        }
+        activateCurrent(currentItem);
         return;
       }
-
       if (key.rightArrow) {
-        if (current.kind === 'schema' && !current.schema.expanded) {
-          void expandSchema(current.schema);
-        } else if (current.kind === 'table' && !current.table.expanded) {
-          void expandTable(current.schema.name, current.table);
-        }
+        expandCurrent(currentItem);
         return;
       }
-
       if (key.leftArrow) {
-        if (current.kind === 'schema' && current.schema.expanded) {
-          updateSchema(current.schema.name, { expanded: false });
-        } else if (current.kind === 'table' && current.table.expanded) {
-          updateTable(current.schema.name, current.table.name, { expanded: false });
-        } else if (current.kind === 'column') {
-          updateTable(current.schema.name, current.table.name, { expanded: false });
-        }
+        collapseCurrent(currentItem);
         return;
       }
     },
     { isActive: focused },
   );
 
+  function activateCurrent(item: FlatItem): void {
+    if (item.kind === 'schema') {
+      patchSchema(item.schema.name, (s) => ({ ...s, expanded: !s.expanded }));
+    } else if (item.kind === 'section') {
+      if (item.section.expanded) {
+        patchSection(item.schema.name, item.section.kind, (s) => ({ ...s, expanded: false }));
+      } else {
+        void expandSection(item.schema, item.section);
+      }
+    } else if (item.kind === 'table') {
+      onSelectTable(item.schema.name, item.table.name);
+    } else if (item.kind === 'column') {
+      onSelectTable(item.schema.name, item.table.name);
+    } else if (item.kind === 'function') {
+      onSelectFunction(
+        buildFunctionTemplate(item.schema.name, item.routine.name, item.routine.prokind, item.routine.args),
+      );
+    }
+  }
+
+  function expandCurrent(item: FlatItem): void {
+    if (item.kind === 'schema' && !item.schema.expanded) {
+      patchSchema(item.schema.name, (s) => ({ ...s, expanded: true }));
+    } else if (item.kind === 'section' && !item.section.expanded) {
+      void expandSection(item.schema, item.section);
+    } else if (item.kind === 'table' && !item.table.expanded) {
+      void expandTable(item.schema.name, item.section.kind, item.table);
+    }
+  }
+
+  function collapseCurrent(item: FlatItem): void {
+    if (item.kind === 'schema' && item.schema.expanded) {
+      patchSchema(item.schema.name, (s) => ({ ...s, expanded: false }));
+    } else if (item.kind === 'section' && item.section.expanded) {
+      patchSection(item.schema.name, item.section.kind, (s) => ({ ...s, expanded: false }));
+    } else if (item.kind === 'table' && item.table.expanded) {
+      patchTable(item.schema.name, item.section.kind, item.table.name, (t) => ({
+        ...t,
+        expanded: false,
+      }));
+    } else if (item.kind === 'column') {
+      patchTable(item.schema.name, sectionKindOfColumn(item, schemas), item.table.name, (t) => ({
+        ...t,
+        expanded: false,
+      }));
+    }
+  }
+
+  // ─────────────── render ───────────────
   if (loading) {
     return (
       <Box flexDirection="column" padding={1}>
@@ -269,41 +547,104 @@ export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelec
     );
   }
 
-  // available width for label (after arrow ' ', indent, icon ' ')
-  const lineWidth = Math.max(8, maxCols - 1); // -1 padding-x
+  const lineWidth = Math.max(8, maxCols - 1);
+  const visibleStart = safeScroll;
+  const visibleEnd = Math.min(total, safeScroll + viewport);
 
   return (
     <Box flexDirection="column" paddingX={1}>
       <Box>
         <Text bold color={focused ? 'cyan' : undefined}>
-          Schemas{' '}
+          {searchMode ? 'Search' : 'Schemas'}{' '}
           <Text dimColor>
-            ({safeCursor + (flat.length === 0 ? 0 : 1)}/{flat.length})
+            ({total === 0 ? 0 : safeCursor + 1}/{total})
           </Text>
         </Text>
       </Box>
+      {searchMode && (
+        <Box>
+          <Text color="cyan">/ </Text>
+          <Box flexGrow={1}>
+            <TextInput
+              value={searchQuery}
+              onChange={(v) => {
+                setSearchQuery(v);
+                setCursor(0);
+                setScroll(0);
+              }}
+              onSubmit={() => activateSearchResult()}
+              placeholder="type to search schema.name…"
+            />
+          </Box>
+        </Box>
+      )}
       <Box height={1}>
-        {hasAbove ? <Text dimColor>▲ {safeScroll} more</Text> : <Text> </Text>}
+        {safeScroll > 0 ? <Text dimColor>▲ {safeScroll} more</Text> : <Text> </Text>}
       </Box>
-      {flat.length === 0 ? (
-        <Text dimColor>No schemas.</Text>
+      {total === 0 ? (
+        searchMode ? (
+          allObjectsLoading ? (
+            <Text>
+              <Spinner type="dots" /> loading objects…
+            </Text>
+          ) : allObjectsError ? (
+            <Text color="red">{truncate(allObjectsError, lineWidth)}</Text>
+          ) : (
+            <Text dimColor>No matches.</Text>
+          )
+        ) : (
+          <Text dimColor>No schemas.</Text>
+        )
+      ) : searchMode ? (
+        searchResults.slice(visibleStart, visibleEnd).map((res, i) => {
+          const realIndex = visibleStart + i;
+          const sel = realIndex === safeCursor;
+          const tag =
+            res.category === 'function' ? (res.kind === 'PROCEDURE' ? 'P' : 'ƒ') :
+            res.category === 'view' ? 'V' : 'T';
+          const label = `${tag}  ${res.schema}.${res.name}`;
+          const arrow = sel ? '▸' : ' ';
+          const line = `${arrow} ${truncate(label, Math.max(1, lineWidth - 2))}`;
+          return (
+            <Text key={realIndex} color={sel ? 'green' : undefined} wrap="truncate">
+              {line}
+            </Text>
+          );
+        })
       ) : (
-        visible.map((item, i) => {
-          const realIndex = safeScroll + i;
+        flat.slice(visibleStart, visibleEnd).map((item, i) => {
+          const realIndex = visibleStart + i;
           const sel = realIndex === safeCursor && focused;
           return <Row key={realIndex} item={item} selected={sel} maxWidth={lineWidth} />;
         })
       )}
       <Box height={1}>
-        {hasBelow ? (
-          <Text dimColor>▼ {flat.length - (safeScroll + viewport)} more</Text>
+        {visibleEnd < total ? (
+          <Text dimColor>▼ {total - visibleEnd} more</Text>
         ) : (
           <Text> </Text>
         )}
       </Box>
+      {searchMode && (
+        <Text dimColor>[Enter] open · [↑↓] move · [Esc] cancel</Text>
+      )}
     </Box>
   );
 };
+
+function sectionKindOfColumn(
+  item: Extract<FlatItem, { kind: 'column' }>,
+  schemas: SchemaNode[],
+): SectionKind {
+  // column may belong to either tables or views; figure out which section holds it.
+  const schema = schemas.find((s) => s.name === item.schema.name);
+  if (!schema) return 'tables';
+  for (const sec of schema.sections) {
+    if (sec.kind === 'functions') continue;
+    if ((sec.tables ?? []).some((t) => t.name === item.table.name)) return sec.kind;
+  }
+  return 'tables';
+}
 
 const Row: React.FC<{ item: FlatItem; selected: boolean; maxWidth: number }> = ({
   item,
@@ -316,21 +657,39 @@ const Row: React.FC<{ item: FlatItem; selected: boolean; maxWidth: number }> = (
   let label = '';
   let dim = false;
   let color: string | undefined;
+  let bold = false;
 
   if (item.kind === 'schema') {
     icon = item.schema.expanded ? '▾' : '▸';
     label = item.schema.name;
-  } else if (item.kind === 'schema-loading') {
+    bold = true;
+  } else if (item.kind === 'section') {
+    icon = item.section.expanded ? '▾' : '▸';
+    const count =
+      item.section.kind === 'functions'
+        ? item.section.routines?.length
+        : item.section.tables?.length;
+    label =
+      SECTION_LABELS[item.section.kind] +
+      (count !== undefined ? `  (${count})` : '');
+    color = 'cyan';
+  } else if (item.kind === 'section-loading') {
     label = 'loading…';
     dim = true;
-  } else if (item.kind === 'schema-error') {
+  } else if (item.kind === 'section-error') {
     icon = '!';
-    label = item.schema.error ?? 'error';
+    label = item.section.error ?? 'error';
     color = 'red';
+  } else if (item.kind === 'section-empty') {
+    label = '(none)';
+    dim = true;
   } else if (item.kind === 'table') {
     icon = item.table.expanded ? '▾' : '▸';
-    const isView = item.table.kind !== 'BASE TABLE';
-    label = item.table.name + (isView ? ` (${item.table.kind.toLowerCase()})` : '');
+    const showKind =
+      item.table.kind !== 'TABLE' && item.table.kind !== 'VIEW'
+        ? `  (${item.table.kind.toLowerCase()})`
+        : '';
+    label = item.table.name + showKind;
   } else if (item.kind === 'table-loading') {
     label = 'loading…';
     dim = true;
@@ -342,15 +701,33 @@ const Row: React.FC<{ item: FlatItem; selected: boolean; maxWidth: number }> = (
     icon = '·';
     label = `${item.column.name}  ${item.column.dataType}`;
     dim = true;
+  } else if (item.kind === 'function') {
+    const tag =
+      item.routine.prokind === 'p'
+        ? 'P'
+        : item.routine.prokind === 'a'
+          ? 'A'
+          : 'ƒ';
+    icon = tag;
+    const args = item.routine.args ? `(${item.routine.args})` : '()';
+    const ret =
+      item.routine.result && item.routine.prokind !== 'p'
+        ? ` → ${item.routine.result}`
+        : '';
+    label = `${item.routine.name}${args}${ret}`;
   }
 
-  // build the line and clip to one terminal line
   const prefix = `${arrow} ${indent}${icon} `;
   const labelBudget = Math.max(1, maxWidth - prefix.length);
   const line = prefix + truncate(label, labelBudget);
 
   return (
-    <Text color={selected ? 'green' : color} dimColor={dim && !selected} wrap="truncate">
+    <Text
+      color={selected ? 'green' : color}
+      dimColor={dim && !selected}
+      bold={bold}
+      wrap="truncate"
+    >
       {line}
     </Text>
   );

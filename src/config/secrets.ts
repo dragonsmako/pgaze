@@ -1,4 +1,4 @@
-const SERVICE = 'pgadmin-tui';
+const SERVICE = 'pgaze';
 
 type Keytar = {
   getPassword: (service: string, account: string) => Promise<string | null>;

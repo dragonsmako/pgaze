@@ -25,6 +25,9 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
   const [pane, setPane] = useState<Pane>('table');
   const [focus, setFocus] = useState<Focus>('tree');
   const [selection, setSelection] = useState<Selection>(null);
+  const [treeSearching, setTreeSearching] = useState(false);
+  const [seedSql, setSeedSql] = useState<string>('');
+  const [seedKey, setSeedKey] = useState(0);
   const { cols, rows } = useTerminalSize();
 
   const totalCols = Math.max(40, cols - FRAME_INNER_COL_OFFSET);
@@ -32,6 +35,8 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
   const leftWidth = Math.max(20, Math.floor(totalCols * 0.32));
 
   useInput((input, key) => {
+    if (treeSearching && focus === 'tree') return;
+
     if (key.escape) {
       if (focus === 'right') {
         setFocus('tree');
@@ -44,7 +49,7 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
       setFocus((f) => (f === 'tree' ? 'right' : 'tree'));
       return;
     }
-    if (input === 'q' && focus === 'tree') {
+    if (key.ctrl && input === 'q') {
       setPane((p) => (p === 'table' ? 'query' : 'table'));
       return;
     }
@@ -66,9 +71,16 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
             focused={focus === 'tree'}
             maxCols={leftWidth - 2}
             maxRows={innerHeight - 2}
+            onSearchingChange={setTreeSearching}
             onSelectTable={(schema, table) => {
               setSelection({ schema, table });
               setPane('table');
+              setFocus('right');
+            }}
+            onSelectFunction={(sql) => {
+              setSeedSql(sql);
+              setSeedKey((k) => k + 1);
+              setPane('query');
               setFocus('right');
             }}
           />
@@ -93,6 +105,8 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
               focused={focus === 'right'}
               maxCols={totalCols - leftWidth - 4}
               maxRows={innerHeight - 4}
+              seedSql={seedSql}
+              seedKey={seedKey}
             />
           )}
         </Box>
@@ -104,10 +118,12 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
         pane={pane}
         hint={
           focus === 'tree'
-            ? '[Tab] focus right · [q] toggle query · [Esc] back to list'
+            ? treeSearching
+              ? '[Enter] open match · [Esc] cancel search'
+              : '[Tab] right · [/] search · [Ctrl+Q] toggle query · [Esc] back'
             : pane === 'table'
-              ? '[n/p] page · [Tab] back to tree · [Esc] tree'
-              : '[Tab] back to tree · [Esc] tree'
+              ? '[↑↓←→] cell · [Enter] copy · [s] sort · [n/p] page · [Ctrl+Q] query · [Tab] tree'
+              : '[Ctrl+Enter / Ctrl+R] run · [e] back to editor · [Ctrl+Q] tables · [Tab] tree'
         }
       />
     </Box>

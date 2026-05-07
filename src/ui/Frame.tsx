@@ -21,7 +21,7 @@ export function useTerminalSize(): { cols: number; rows: number } {
   };
 }
 
-export const Frame: React.FC<Props> = ({ title = 'pgadmin-tui', subtitle, children }) => {
+export const Frame: React.FC<Props> = ({ title = 'pgaze', subtitle, children }) => {
   const { cols, rows } = useTerminalSize();
   return (
     <Box
