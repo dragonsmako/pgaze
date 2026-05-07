@@ -1,5 +1,12 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Box, Text } from 'ink';
+import { clip, pad, sanitizeCell } from '../lib/textUtil.js';
+import {
+  COL_SEP,
+  COL_SEP_NARROW,
+  MAX_COL_WIDTH,
+  MIN_COL_WIDTH,
+} from '../config/uiConstants.js';
 
 export type GridCursor = { row: number; col: number };
 export type GridSort = { column: string; dir: 'asc' | 'desc' };
@@ -17,26 +24,13 @@ function formatCell(value: unknown): string {
   if (value === null || value === undefined) return 'NULL';
   if (typeof value === 'object') {
     try {
-      return JSON.stringify(value);
+      return sanitizeCell(JSON.stringify(value));
     } catch {
-      return String(value);
+      return sanitizeCell(String(value));
     }
   }
-  return String(value).replace(/[\r\n\t]+/g, ' ');
+  return sanitizeCell(String(value));
 }
-
-function pad(s: string, width: number): string {
-  if (width <= 0) return '';
-  if (s.length === width) return s;
-  if (s.length > width) {
-    if (width <= 1) return '…';
-    return s.slice(0, width - 1) + '…';
-  }
-  return s + ' '.repeat(width - s.length);
-}
-
-const MAX_COL_WIDTH = 32;
-const MIN_COL_WIDTH = 3;
 
 function naturalWidth(header: string, cellsForCol: string[]): number {
   let w = header.length;
@@ -46,7 +40,7 @@ function naturalWidth(header: string, cellsForCol: string[]): number {
 
 type Window = {
   start: number;
-  end: number; // inclusive
+  end: number;
   widths: number[];
   sep: string;
   sepWidth: number;
@@ -57,10 +51,9 @@ function computeWindow(
   maxCols: number,
   cursorCol: number | null,
 ): Window {
-  // Try ' │ ' first, then ' '
   for (const { sep, sepWidth } of [
-    { sep: ' │ ', sepWidth: 3 },
-    { sep: ' ', sepWidth: 1 },
+    { sep: COL_SEP, sepWidth: COL_SEP.length },
+    { sep: COL_SEP_NARROW, sepWidth: COL_SEP_NARROW.length },
   ]) {
     let start = 0;
     while (start < natural.length) {
@@ -77,21 +70,17 @@ function computeWindow(
         if (used >= maxCols) break;
       }
       if (end < start) {
-        // can't fit even one column at this start; advance
         start += 1;
         continue;
       }
-      const cursorVisible = cursorCol === null || (cursorCol >= start && cursorCol <= end);
+      const cursorVisible =
+        cursorCol === null || (cursorCol >= start && cursorCol <= end);
       const cursorBeforeWindow = cursorCol !== null && cursorCol < start;
       if (cursorVisible) return { start, end, widths, sep, sepWidth };
-      if (cursorBeforeWindow) {
-        // shouldn't happen because we increment start; bail
-        return { start, end, widths, sep, sepWidth };
-      }
+      if (cursorBeforeWindow) return { start, end, widths, sep, sepWidth };
       start += 1;
     }
   }
-  // Fallback: a single column truncated
   return { start: 0, end: 0, widths: [Math.max(1, maxCols)], sep: ' ', sepWidth: 1 };
 }
 
@@ -118,7 +107,45 @@ function buildSegments(
   };
 }
 
-export const DataGrid: React.FC<Props> = ({ columns, rows, maxCols, maxRows, cursor, sort }) => {
+export const DataGrid: React.FC<Props> = ({
+  columns,
+  rows,
+  maxCols,
+  maxRows,
+  cursor,
+  sort,
+}) => {
+  // Memoise expensive per-render work: cell formatting and natural widths.
+  // We key by reference identity of `columns`/`rows` (callers don't mutate
+  // these arrays — they replace them on new fetches).
+  const visibleRows = useMemo(
+    () => rows.slice(0, Math.max(0, maxRows)),
+    [rows, maxRows],
+  );
+
+  const cellStrings = useMemo(
+    () => visibleRows.map((row) => columns.map((_, i) => formatCell(row[i]))),
+    [columns, visibleRows],
+  );
+
+  const headers = useMemo(
+    () =>
+      columns.map((c) => {
+        if (sort && sort.column === c) return c + (sort.dir === 'asc' ? ' ↑' : ' ↓');
+        return c;
+      }),
+    [columns, sort],
+  );
+
+  const natural = useMemo(
+    () =>
+      columns.map((_, i) => {
+        const colCells = cellStrings.map((r) => r[i] ?? '');
+        return naturalWidth(headers[i] ?? '', colCells);
+      }),
+    [columns, cellStrings, headers],
+  );
+
   if (columns.length === 0) {
     return (
       <Box paddingX={1}>
@@ -127,27 +154,10 @@ export const DataGrid: React.FC<Props> = ({ columns, rows, maxCols, maxRows, cur
     );
   }
 
-  const visibleRows = rows.slice(0, Math.max(0, maxRows));
-  const cellStrings: string[][] = visibleRows.map((row) =>
-    columns.map((_, i) => formatCell(row[i])),
-  );
-
-  // Header text decorated with sort arrow
-  const headers = columns.map((c) => {
-    if (sort && sort.column === c) return c + (sort.dir === 'asc' ? ' ↑' : ' ↓');
-    return c;
-  });
-
-  // natural widths from headers + visible cells
-  const natural = columns.map((_, i) => {
-    const colCells = cellStrings.map((r) => r[i] ?? '');
-    return naturalWidth(headers[i] ?? '', colCells);
-  });
-
-  const cursorCol = cursor ? Math.min(Math.max(0, cursor.col), columns.length - 1) : null;
+  const cursorCol =
+    cursor ? Math.min(Math.max(0, cursor.col), columns.length - 1) : null;
   const win = computeWindow(natural, maxCols, cursorCol);
 
-  // Build header line (prefix/mid/suffix split if cursor is in window)
   const headerSegs = buildSegments(
     headers,
     win.widths,
@@ -157,12 +167,15 @@ export const DataGrid: React.FC<Props> = ({ columns, rows, maxCols, maxRows, cur
     cursorCol,
   );
 
-  const ruleParts = win.widths.map((w) => '─'.repeat(w));
   const ruleSep = win.sep.replace(/[│ ]/g, '─');
-  const ruleLine = ruleParts.join(ruleSep);
+  const ruleLine = clip(
+    win.widths.map((w) => '─'.repeat(w)).join(ruleSep),
+    maxCols,
+  );
 
   const dataLines = cellStrings.map((row, rIdx) => {
-    const isCursorRow = cursor !== null && cursor !== undefined && cursor.row === rIdx;
+    const isCursorRow =
+      cursor !== null && cursor !== undefined && cursor.row === rIdx;
     const segs = buildSegments(
       row,
       win.widths,

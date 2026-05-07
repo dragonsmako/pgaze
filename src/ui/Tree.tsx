@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import Spinner from 'ink-spinner';
@@ -13,6 +13,10 @@ import {
   listViews,
   type AllObject,
 } from '../db/introspect.js';
+import { truncate } from '../lib/textUtil.js';
+import { useScrollViewport } from '../lib/useScrollViewport.js';
+import { assertNever } from '../lib/assert.js';
+import { SEARCH_DEBOUNCE_MS } from '../config/uiConstants.js';
 
 type SectionKind = 'tables' | 'views' | 'functions';
 
@@ -70,13 +74,6 @@ type Props = {
   onSearchingChange?: (searching: boolean) => void;
 };
 
-function truncate(s: string, width: number): string {
-  if (width <= 0) return '';
-  if (s.length <= width) return s;
-  if (width <= 1) return '…';
-  return s.slice(0, width - 1) + '…';
-}
-
 function quoteIdent(name: string): string {
   return '"' + name.replace(/"/g, '""') + '"';
 }
@@ -88,7 +85,10 @@ function buildFunctionTemplate(
   args?: string,
 ): string {
   const qualified = `${quoteIdent(schema)}.${quoteIdent(name)}`;
-  const argList = args && args.trim().length > 0 ? `/* ${args} */` : '';
+  // Escape any `*/` in the argument signature so a malicious function
+  // metadata cannot break out of the comment and inject SQL.
+  const safe = args ? args.replace(/\*\//g, '*\\/') : '';
+  const argList = safe.trim().length > 0 ? `/* ${safe} */` : '';
   if (prokind === 'p') {
     return `CALL ${qualified}(${argList});`;
   }
@@ -120,10 +120,10 @@ export const Tree: React.FC<Props> = ({
   const [loading, setLoading] = useState(true);
   const [topError, setTopError] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
-  const [scroll, setScroll] = useState(0);
 
   const [searchMode, setSearchMode] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [allObjects, setAllObjects] = useState<AllObject[] | null>(null);
   const [allObjectsLoading, setAllObjectsLoading] = useState(false);
   const [allObjectsError, setAllObjectsError] = useState<string | null>(null);
@@ -131,6 +131,16 @@ export const Tree: React.FC<Props> = ({
   useEffect(() => {
     onSearchingChange?.(searchMode);
   }, [searchMode, onSearchingChange]);
+
+  // Debounce the search query so filtering doesn't run on every keystroke.
+  useEffect(() => {
+    if (!searchMode) {
+      setDebouncedQuery('');
+      return;
+    }
+    const t = setTimeout(() => setDebouncedQuery(searchQuery), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [searchQuery, searchMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,86 +161,72 @@ export const Tree: React.FC<Props> = ({
     };
   }, [conn]);
 
-  // ─────────────── flat list ───────────────
-  let flat: FlatItem[] = [];
-  let searchResults: AllObject[] = [];
-
-  if (searchMode) {
-    const q = searchQuery.trim().toLowerCase();
+  // ─────────────── flat list (memoised) ───────────────
+  const searchResults = useMemo<AllObject[]>(() => {
+    if (!searchMode) return [];
+    const q = debouncedQuery.trim().toLowerCase();
     const source = allObjects ?? [];
-    searchResults =
-      q.length === 0
-        ? source.slice(0, 200)
-        : source.filter((o) =>
-            (o.schema + '.' + o.name).toLowerCase().includes(q),
-          );
-  } else {
+    if (q.length === 0) return source.slice(0, 200);
+    return source.filter((o) => (o.schema + '.' + o.name).toLowerCase().includes(q));
+  }, [searchMode, debouncedQuery, allObjects]);
+
+  const flat = useMemo<FlatItem[]>(() => {
+    if (searchMode) return [];
+    const out: FlatItem[] = [];
     schemas.forEach((schema) => {
-      flat.push({ kind: 'schema', depth: 0, schema });
+      out.push({ kind: 'schema', depth: 0, schema });
       if (!schema.expanded) return;
       schema.sections.forEach((section) => {
-        flat.push({ kind: 'section', depth: 1, schema, section });
+        out.push({ kind: 'section', depth: 1, schema, section });
         if (!section.expanded) return;
         if (section.loading) {
-          flat.push({ kind: 'section-loading', depth: 2, schema, section });
+          out.push({ kind: 'section-loading', depth: 2, schema, section });
           return;
         }
         if (section.error) {
-          flat.push({ kind: 'section-error', depth: 2, schema, section });
+          out.push({ kind: 'section-error', depth: 2, schema, section });
           return;
         }
         if (section.kind === 'functions') {
           const items = section.routines ?? [];
           if (items.length === 0) {
-            flat.push({ kind: 'section-empty', depth: 2, schema, section });
+            out.push({ kind: 'section-empty', depth: 2, schema, section });
             return;
           }
           items.forEach((routine) => {
-            flat.push({ kind: 'function', depth: 2, schema, routine });
+            out.push({ kind: 'function', depth: 2, schema, routine });
           });
         } else {
           const items = section.tables ?? [];
           if (items.length === 0) {
-            flat.push({ kind: 'section-empty', depth: 2, schema, section });
+            out.push({ kind: 'section-empty', depth: 2, schema, section });
             return;
           }
           items.forEach((table) => {
-            flat.push({ kind: 'table', depth: 2, schema, section, table });
+            out.push({ kind: 'table', depth: 2, schema, section, table });
             if (!table.expanded) return;
             if (table.loading) {
-              flat.push({ kind: 'table-loading', depth: 3, schema, table });
+              out.push({ kind: 'table-loading', depth: 3, schema, table });
               return;
             }
             if (table.error) {
-              flat.push({ kind: 'table-error', depth: 3, schema, table });
+              out.push({ kind: 'table-error', depth: 3, schema, table });
               return;
             }
             (table.columns ?? []).forEach((column) => {
-              flat.push({ kind: 'column', depth: 3, schema, table, column });
+              out.push({ kind: 'column', depth: 3, schema, table, column });
             });
           });
         }
       });
     });
-  }
+    return out;
+  }, [schemas, searchMode]);
 
   const total = searchMode ? searchResults.length : flat.length;
-  const safeCursor = total === 0 ? 0 : Math.min(cursor, total - 1);
   const headerRows = searchMode ? 3 : 2;
   const viewport = Math.max(1, maxRows - headerRows - 2);
-  const safeScroll = Math.max(0, Math.min(scroll, Math.max(0, total - viewport)));
-
-  useEffect(() => {
-    setScroll((prev) => {
-      let next = prev;
-      if (safeCursor < next) next = safeCursor;
-      else if (safeCursor >= next + viewport) next = safeCursor - viewport + 1;
-      const max = Math.max(0, total - viewport);
-      if (next > max) next = max;
-      if (next < 0) next = 0;
-      return next;
-    });
-  }, [safeCursor, viewport, total]);
+  const { safeCursor, safeScroll } = useScrollViewport({ cursor, total, viewport });
 
   // ─────────────── mutators ───────────────
   function patchSchema(name: string, fn: (s: SchemaNode) => SchemaNode): void {
@@ -341,8 +337,8 @@ export const Tree: React.FC<Props> = ({
   async function enterSearchMode(): Promise<void> {
     setSearchMode(true);
     setSearchQuery('');
+    setDebouncedQuery('');
     setCursor(0);
-    setScroll(0);
     if (allObjects === null && !allObjectsLoading) {
       setAllObjectsLoading(true);
       setAllObjectsError(null);
@@ -360,8 +356,8 @@ export const Tree: React.FC<Props> = ({
   function exitSearchMode(): void {
     setSearchMode(false);
     setSearchQuery('');
+    setDebouncedQuery('');
     setCursor(0);
-    setScroll(0);
   }
 
   function activateSearchResult(): void {
@@ -481,22 +477,42 @@ export const Tree: React.FC<Props> = ({
   );
 
   function activateCurrent(item: FlatItem): void {
-    if (item.kind === 'schema') {
-      patchSchema(item.schema.name, (s) => ({ ...s, expanded: !s.expanded }));
-    } else if (item.kind === 'section') {
-      if (item.section.expanded) {
-        patchSection(item.schema.name, item.section.kind, (s) => ({ ...s, expanded: false }));
-      } else {
-        void expandSection(item.schema, item.section);
-      }
-    } else if (item.kind === 'table') {
-      onSelectTable(item.schema.name, item.table.name);
-    } else if (item.kind === 'column') {
-      onSelectTable(item.schema.name, item.table.name);
-    } else if (item.kind === 'function') {
-      onSelectFunction(
-        buildFunctionTemplate(item.schema.name, item.routine.name, item.routine.prokind, item.routine.args),
-      );
+    switch (item.kind) {
+      case 'schema':
+        patchSchema(item.schema.name, (s) => ({ ...s, expanded: !s.expanded }));
+        return;
+      case 'section':
+        if (item.section.expanded) {
+          patchSection(item.schema.name, item.section.kind, (s) => ({
+            ...s,
+            expanded: false,
+          }));
+        } else {
+          void expandSection(item.schema, item.section);
+        }
+        return;
+      case 'table':
+      case 'column':
+        onSelectTable(item.schema.name, item.table.name);
+        return;
+      case 'function':
+        onSelectFunction(
+          buildFunctionTemplate(
+            item.schema.name,
+            item.routine.name,
+            item.routine.prokind,
+            item.routine.args,
+          ),
+        );
+        return;
+      case 'section-loading':
+      case 'section-error':
+      case 'section-empty':
+      case 'table-loading':
+      case 'table-error':
+        return; // non-actionable rows
+      default:
+        return assertNever(item);
     }
   }
 
@@ -521,10 +537,12 @@ export const Tree: React.FC<Props> = ({
         expanded: false,
       }));
     } else if (item.kind === 'column') {
-      patchTable(item.schema.name, sectionKindOfColumn(item, schemas), item.table.name, (t) => ({
-        ...t,
-        expanded: false,
-      }));
+      patchTable(
+        item.schema.name,
+        sectionKindOfColumn(item, schemas),
+        item.table.name,
+        (t) => ({ ...t, expanded: false }),
+      );
     }
   }
 
@@ -570,7 +588,6 @@ export const Tree: React.FC<Props> = ({
               onChange={(v) => {
                 setSearchQuery(v);
                 setCursor(0);
-                setScroll(0);
               }}
               onSubmit={() => activateSearchResult()}
               placeholder="type to search schema.name…"

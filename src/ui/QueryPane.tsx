@@ -8,10 +8,15 @@ import { extractVariables, substituteVariables } from '../db/sqlVars.js';
 import type { QueryResult } from '../types.js';
 import { DataGrid } from './DataGrid.js';
 import {
-  keypressBus,
-  looksLikeCtrlEnterFragment,
-  recentlySawCtrlEnter,
-} from '../lib/keypress.js';
+  MultilineEditor,
+  type MultilineEditorState,
+  emptyEditorState,
+  editorStateFromText,
+  editorStateText,
+} from './MultilineEditor.js';
+import { keypressBus } from '../lib/keypress.js';
+import { stripAnsi } from '../lib/textUtil.js';
+import { IMPLICIT_AD_HOC_LIMIT } from '../config/uiConstants.js';
 
 type Props = {
   conn: Connection;
@@ -24,129 +29,6 @@ type Props = {
 
 type Mode = 'editor' | 'variables' | 'running' | 'results';
 
-type EditorState = {
-  lines: string[];
-  cursorRow: number;
-  cursorCol: number;
-};
-
-const initialEditor: EditorState = { lines: [''], cursorRow: 0, cursorCol: 0 };
-
-function clamp(n: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, n));
-}
-
-const moveLeft = (s: EditorState): EditorState => {
-  if (s.cursorCol > 0) return { ...s, cursorCol: s.cursorCol - 1 };
-  if (s.cursorRow > 0) {
-    const newRow = s.cursorRow - 1;
-    return { ...s, cursorRow: newRow, cursorCol: (s.lines[newRow] ?? '').length };
-  }
-  return s;
-};
-
-const moveRight = (s: EditorState): EditorState => {
-  const line = s.lines[s.cursorRow] ?? '';
-  if (s.cursorCol < line.length) return { ...s, cursorCol: s.cursorCol + 1 };
-  if (s.cursorRow < s.lines.length - 1) {
-    return { ...s, cursorRow: s.cursorRow + 1, cursorCol: 0 };
-  }
-  return s;
-};
-
-const moveUp = (s: EditorState): EditorState => {
-  if (s.cursorRow === 0) return { ...s, cursorCol: 0 };
-  const newRow = s.cursorRow - 1;
-  const len = (s.lines[newRow] ?? '').length;
-  return { ...s, cursorRow: newRow, cursorCol: clamp(s.cursorCol, 0, len) };
-};
-
-const moveDown = (s: EditorState): EditorState => {
-  if (s.cursorRow >= s.lines.length - 1) {
-    const len = (s.lines[s.cursorRow] ?? '').length;
-    return { ...s, cursorCol: len };
-  }
-  const newRow = s.cursorRow + 1;
-  const len = (s.lines[newRow] ?? '').length;
-  return { ...s, cursorRow: newRow, cursorCol: clamp(s.cursorCol, 0, len) };
-};
-
-const moveWordLeft = (s: EditorState): EditorState => {
-  const line = s.lines[s.cursorRow] ?? '';
-  let col = s.cursorCol;
-  while (col > 0 && /\s/.test(line[col - 1] ?? '')) col--;
-  while (col > 0 && !/\s/.test(line[col - 1] ?? '')) col--;
-  if (col === s.cursorCol && s.cursorRow > 0) {
-    const prev = s.lines[s.cursorRow - 1] ?? '';
-    return { ...s, cursorRow: s.cursorRow - 1, cursorCol: prev.length };
-  }
-  return { ...s, cursorCol: col };
-};
-
-const moveWordRight = (s: EditorState): EditorState => {
-  const line = s.lines[s.cursorRow] ?? '';
-  let col = s.cursorCol;
-  while (col < line.length && !/\s/.test(line[col] ?? '')) col++;
-  while (col < line.length && /\s/.test(line[col] ?? '')) col++;
-  if (col === s.cursorCol && s.cursorRow < s.lines.length - 1) {
-    return { ...s, cursorRow: s.cursorRow + 1, cursorCol: 0 };
-  }
-  return { ...s, cursorCol: col };
-};
-
-const moveDocStart = (s: EditorState): EditorState => ({ ...s, cursorRow: 0, cursorCol: 0 });
-const moveDocEnd = (s: EditorState): EditorState => {
-  const lr = s.lines.length - 1;
-  const len = (s.lines[lr] ?? '').length;
-  return { ...s, cursorRow: lr, cursorCol: len };
-};
-
-const insertNewline = (s: EditorState): EditorState => {
-  const line = s.lines[s.cursorRow] ?? '';
-  const before = line.slice(0, s.cursorCol);
-  const after = line.slice(s.cursorCol);
-  const lines = [...s.lines];
-  lines[s.cursorRow] = before;
-  lines.splice(s.cursorRow + 1, 0, after);
-  return { lines, cursorRow: s.cursorRow + 1, cursorCol: 0 };
-};
-
-const backspace = (s: EditorState): EditorState => {
-  if (s.cursorCol > 0) {
-    const line = s.lines[s.cursorRow] ?? '';
-    const newLine = line.slice(0, s.cursorCol - 1) + line.slice(s.cursorCol);
-    const lines = [...s.lines];
-    lines[s.cursorRow] = newLine;
-    return { ...s, lines, cursorCol: s.cursorCol - 1 };
-  }
-  if (s.cursorRow > 0) {
-    const prev = s.lines[s.cursorRow - 1] ?? '';
-    const cur = s.lines[s.cursorRow] ?? '';
-    const lines = [...s.lines];
-    lines.splice(s.cursorRow, 1);
-    lines[s.cursorRow - 1] = prev + cur;
-    return { lines, cursorRow: s.cursorRow - 1, cursorCol: prev.length };
-  }
-  return s;
-};
-
-function insertText(s: EditorState, text: string): EditorState {
-  const parts = text.split(/\r\n|\r|\n/);
-  let cur = s;
-  for (let i = 0; i < parts.length; i++) {
-    if (i > 0) cur = insertNewline(cur);
-    const piece = parts[i] ?? '';
-    if (piece.length > 0) {
-      const line = cur.lines[cur.cursorRow] ?? '';
-      const newLine = line.slice(0, cur.cursorCol) + piece + line.slice(cur.cursorCol);
-      const lines = [...cur.lines];
-      lines[cur.cursorRow] = newLine;
-      cur = { ...cur, lines, cursorCol: cur.cursorCol + piece.length };
-    }
-  }
-  return cur;
-}
-
 function severityColor(severity: string): string | undefined {
   const s = severity.toUpperCase();
   if (s === 'WARNING') return 'yellow';
@@ -157,22 +39,97 @@ function severityColor(severity: string): string | undefined {
   return undefined;
 }
 
-function isPrintable(s: string): boolean {
-  if (s.length === 0) return false;
-  for (const ch of s) {
-    const code = ch.charCodeAt(0);
-    if (code >= 32 && code !== 127) return true;
-  }
-  return false;
+// Detect a bare top-level SELECT without LIMIT or multiple statements,
+// using the SQL-aware tokenizer for accuracy. We only auto-LIMIT in this
+// safe case; everything else passes through untouched.
+function shouldAutoLimit(sql: string): boolean {
+  const trimmed = sql.trim().replace(/;\s*$/, '');
+  if (!/^\s*select\b/i.test(trimmed)) return false;
+  if (/\blimit\s+\d/i.test(trimmed)) return false;
+  // Reject multiple top-level statements (use the existing tokenizer to
+  // count semicolons outside strings/comments/dollar-quotes).
+  const semis = countTopLevelSemicolons(trimmed);
+  if (semis > 0) return false;
+  return true;
 }
 
-export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, seedSql, seedKey }) => {
-  const [editor, setEditor] = useState<EditorState>(initialEditor);
-  const [scroll, setScroll] = useState(0);
+function countTopLevelSemicolons(sql: string): number {
+  // Lightweight reuse of the same state machine as sqlVars.tokenize:
+  // we don't need full tokens, just to skip over strings/comments/dollar
+  // quotes when looking for `;`.
+  let i = 0;
+  let semis = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "'") {
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '-' && sql[i + 1] === '-') {
+      while (i < sql.length && sql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') { depth++; i += 2; }
+        else if (sql[i] === '*' && sql[i + 1] === '/') { depth--; i += 2; }
+        else i++;
+      }
+      continue;
+    }
+    if (ch === '$') {
+      const m = sql.slice(i).match(/^\$([a-zA-Z_][a-zA-Z0-9_]*)?\$/);
+      if (m) {
+        const tag = m[0];
+        i += tag.length;
+        const close = sql.indexOf(tag, i);
+        if (close === -1) { i = sql.length; }
+        else { i = close + tag.length; }
+        continue;
+      }
+    }
+    if (ch === ';') semis++;
+    i++;
+  }
+  return semis;
+}
+
+export const QueryPane: React.FC<Props> = ({
+  conn,
+  focused,
+  maxCols,
+  maxRows,
+  seedSql,
+  seedKey,
+}) => {
+  const [editor, setEditor] = useState<MultilineEditorState>(emptyEditorState);
   const [mode, setMode] = useState<Mode>('editor');
   const [result, setResult] = useState<QueryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastSql, setLastSql] = useState('');
+  const [autoLimited, setAutoLimited] = useState(false);
 
   // variable prompt state
   const [varNames, setVarNames] = useState<string[]>([]);
@@ -180,49 +137,31 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
   const [varCache, setVarCache] = useState<Record<string, string>>({});
   const [varFocus, setVarFocus] = useState<number>(0);
 
-  const headerRows = 1;
-  const footerRows = 1;
-  const viewport = Math.max(3, maxRows - headerRows - footerRows);
-
+  // ────── seed SQL when the tree picks a function template ──────
   useEffect(() => {
-    setScroll((prev) => {
-      const cr = editor.cursorRow;
-      let next = prev;
-      if (cr < next) next = cr;
-      else if (cr >= next + viewport) next = cr - viewport + 1;
-      const max = Math.max(0, editor.lines.length - viewport);
-      if (next > max) next = max;
-      if (next < 0) next = 0;
-      return next;
-    });
-  }, [editor.cursorRow, editor.lines.length, viewport]);
-
-  // Seed editor when ConnectedView pushes a function template (keyed so each push re-applies).
-  useEffect(() => {
-    if (seedKey === undefined || seedSql === undefined) return;
-    if (seedKey === 0) return; // initial mount with no actual seed yet
-    const lines = seedSql.length === 0 ? [''] : seedSql.split('\n');
-    setEditor({ lines, cursorRow: 0, cursorCol: 0 });
+    if (seedKey === undefined || seedKey === 0) return;
+    if (seedSql === undefined) return;
+    setEditor(editorStateFromText(seedSql));
     setMode('editor');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seedKey]);
 
   // ────── execution flow ──────
 
+  // We keep refs for cancellation + stable closures used by the keypressBus.
+  const cancelRef = useRef<{ cancelled: boolean } | null>(null);
+
   function startExecute(): void {
     if (mode !== 'editor') return;
-    const sql = editor.lines.join('\n').trim();
+    const sql = editorStateText(editor).trim();
     if (sql.length === 0) return;
     const vars = extractVariables(sql);
     if (vars.length === 0) {
       runWithVars(sql, {});
       return;
     }
-    // prompt for values
     const initial: Record<string, string> = {};
-    for (const v of vars) {
-      initial[v] = varCache[v] ?? '';
-    }
+    for (const v of vars) initial[v] = varCache[v] ?? '';
     setVarNames(vars);
     setVarValues(initial);
     setVarFocus(0);
@@ -235,16 +174,39 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
       valuesForSubst[k] = v.length === 0 ? null : v;
     }
     const { sql: out, values } = substituteVariables(sql, valuesForSubst);
+    // 2.4: implicit LIMIT for a bare SELECT to avoid OOM.
+    let finalSql = out;
+    let limited = false;
+    if (values.length === 0 && shouldAutoLimit(out)) {
+      finalSql = `${out.replace(/;\s*$/, '')} LIMIT ${IMPLICIT_AD_HOC_LIMIT}`;
+      limited = true;
+    }
+    // 2.7: warn on multi-statement + variables before pg rejects it.
+    if (values.length > 0 && countTopLevelSemicolons(out.replace(/;\s*$/, '')) > 0) {
+      setError(
+        'Queries that use :variables can only contain one statement. Remove the inner `;` and try again.',
+      );
+      setLastSql(sql);
+      setResult(null);
+      setAutoLimited(false);
+      setMode('results');
+      return;
+    }
     setLastSql(sql);
+    setAutoLimited(limited);
     setMode('running');
     setError(null);
     setResult(null);
-    runQuery(conn, out, values)
+    const token = { cancelled: false };
+    cancelRef.current = token;
+    runQuery(conn, finalSql, values)
       .then((res) => {
+        if (token.cancelled) return;
         setResult(res);
         setMode('results');
       })
       .catch((err: unknown) => {
+        if (token.cancelled) return;
         setError(err instanceof Error ? err.message : String(err));
         setMode('results');
       });
@@ -252,56 +214,42 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
 
   function confirmVarsAndRun(): void {
     setVarCache((prev) => ({ ...prev, ...varValues }));
-    const sql = editor.lines.join('\n').trim();
+    const sql = editorStateText(editor).trim();
     runWithVars(sql, varValues);
   }
 
-  // Listen for the disambiguated Ctrl+Enter from the terminal protocols.
-  const startExecuteRef = useRef(startExecute);
-  startExecuteRef.current = startExecute;
+  // Cancel any in-flight query when this component unmounts (or pane changes).
   useEffect(() => {
-    const handler = (): void => {
-      if (focused && mode === 'editor') startExecuteRef.current();
+    return () => {
+      if (cancelRef.current) cancelRef.current.cancelled = true;
     };
+  }, []);
+
+  // 2.1: single keypressBus subscription with a ref-based dispatcher.
+  const dispatchRef = useRef<() => void>(() => {});
+  dispatchRef.current = () => {
+    if (!focused) return;
+    if (mode === 'editor') startExecute();
+    else if (mode === 'variables') confirmVarsAndRun();
+  };
+  useEffect(() => {
+    const handler = (): void => dispatchRef.current();
     keypressBus.on('ctrl-enter', handler);
     return () => {
       keypressBus.off('ctrl-enter', handler);
     };
-  }, [focused, mode]);
+  }, []);
 
-  // ────── input handling ──────
-
+  // ────── input handling for non-editor modes ──────
   useInput(
     (input, key) => {
       if (mode === 'editor') {
-        // ctrl+R always works as a reliable fallback
-        if ((key.ctrl && key.return) || (key.ctrl && input === 'r')) {
+        // Ctrl+R fallback for terminals that don't distinguish Ctrl+Enter.
+        if (key.ctrl && input === 'r') {
           startExecute();
           return;
         }
-        // movement
-        if (key.ctrl && key.upArrow) return setEditor(moveDocStart);
-        if (key.ctrl && key.downArrow) return setEditor(moveDocEnd);
-        if (key.ctrl && key.leftArrow) return setEditor(moveWordLeft);
-        if (key.ctrl && key.rightArrow) return setEditor(moveWordRight);
-        if (key.upArrow) return setEditor(moveUp);
-        if (key.downArrow) return setEditor(moveDown);
-        if (key.leftArrow) return setEditor(moveLeft);
-        if (key.rightArrow) return setEditor(moveRight);
-        if (key.return) {
-          // suppress newline if a Ctrl+Enter escape just fired
-          if (recentlySawCtrlEnter()) return;
-          setEditor(insertNewline);
-          return;
-        }
-        if (key.backspace || key.delete) return setEditor(backspace);
-        if (input && !key.ctrl && !key.meta && !key.escape && !key.tab) {
-          if (looksLikeCtrlEnterFragment(input)) return;
-          if (isPrintable(input)) {
-            setEditor((s) => insertText(s, input));
-          }
-          return;
-        }
+        // The MultilineEditor owns all other keys when focused.
         return;
       }
 
@@ -320,18 +268,16 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
         }
         if (key.tab) {
           setVarFocus((i) => {
-            const total = varNames.length + 1; // fields + Run button
+            const total = varNames.length + 1;
             const dir = key.shift ? -1 : 1;
             return (i + dir + total) % total;
           });
           return;
         }
-        // Enter on Run button: runs
         if (key.return && varFocus === varNames.length) {
           confirmVarsAndRun();
           return;
         }
-        // Ctrl+R / Ctrl+Enter run too
         if ((key.ctrl && key.return) || (key.ctrl && input === 'r')) {
           confirmVarsAndRun();
           return;
@@ -344,24 +290,10 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
           setMode('editor');
           return;
         }
-        return;
       }
     },
     { isActive: focused },
   );
-
-  // also handle Ctrl+Enter in variables mode via the terminal protocol bus
-  useEffect(() => {
-    if (mode !== 'variables') return;
-    const handler = (): void => {
-      if (focused) confirmVarsAndRun();
-    };
-    keypressBus.on('ctrl-enter', handler);
-    return () => {
-      keypressBus.off('ctrl-enter', handler);
-    };
-    // confirmVarsAndRun closes over varValues which is fine for a one-shot listener
-  }, [mode, focused, varValues]);
 
   // ────── render ──────
 
@@ -462,9 +394,17 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
           <Text dimColor wrap="truncate">› {sqlPreview}</Text>
         </Box>
 
+        {autoLimited && (
+          <Box paddingX={1} marginTop={1}>
+            <Text color="yellow">
+              ⚠ Auto-applied LIMIT {IMPLICIT_AD_HOC_LIMIT}. Add an explicit LIMIT to query for more rows.
+            </Text>
+          </Box>
+        )}
+
         {error && (
           <Box paddingX={1} marginTop={1}>
-            <Text color="red">{error}</Text>
+            <Text color="red">{stripAnsi(error)}</Text>
           </Box>
         )}
 
@@ -473,7 +413,7 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
             <Text dimColor>messages:</Text>
             {notices.map((n, i) => (
               <Text key={i} color={severityColor(n.severity)} wrap="truncate">
-                {n.severity}: {n.message}
+                {stripAnsi(n.severity)}: {stripAnsi(n.message)}
               </Text>
             ))}
           </Box>
@@ -503,19 +443,14 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
     );
   }
 
-  // editor
-  const visibleStart = scroll;
-  const visibleEnd = Math.min(editor.lines.length, scroll + viewport);
-  const totalLines = editor.lines.length;
-  const lineNumWidth = String(totalLines).length;
-
+  // editor mode
   return (
     <Box flexDirection="column">
       <Box paddingX={1} flexDirection="row" justifyContent="space-between">
         <Text>
           <Text bold color="magenta">SQL editor</Text>
           <Text dimColor>
-            {'  '}line {editor.cursorRow + 1}/{totalLines} · col {editor.cursorCol + 1}
+            {'  '}line {editor.cursorRow + 1}/{editor.lines.length} · col {editor.cursorCol + 1}
           </Text>
         </Text>
         {focused && (
@@ -524,71 +459,13 @@ export const QueryPane: React.FC<Props> = ({ conn, focused, maxCols, maxRows, se
           </Text>
         )}
       </Box>
-      <Box flexDirection="column" paddingX={1}>
-        {Array.from({ length: visibleEnd - visibleStart }, (_, i) => {
-          const realRow = visibleStart + i;
-          const line = editor.lines[realRow] ?? '';
-          const isCursorRow = realRow === editor.cursorRow && focused;
-          return (
-            <EditorLine
-              key={realRow}
-              line={line}
-              row={realRow}
-              lineNumWidth={lineNumWidth}
-              cursorCol={isCursorRow ? editor.cursorCol : null}
-              maxCols={maxCols}
-            />
-          );
-        })}
-        {Array.from(
-          { length: Math.max(0, viewport - (visibleEnd - visibleStart)) },
-          (_, i) => (
-            <Text key={`blank-${i}`} dimColor>
-              {' '.repeat(lineNumWidth) + ' ~'}
-            </Text>
-          ),
-        )}
-      </Box>
+      <MultilineEditor
+        state={editor}
+        onChange={setEditor}
+        focused={focused}
+        maxCols={maxCols}
+        maxRows={Math.max(3, maxRows - 1)}
+      />
     </Box>
-  );
-};
-
-const EditorLine: React.FC<{
-  line: string;
-  row: number;
-  lineNumWidth: number;
-  cursorCol: number | null;
-  maxCols: number;
-}> = ({ line, row, lineNumWidth, cursorCol, maxCols }) => {
-  const num = String(row + 1).padStart(lineNumWidth, ' ');
-  const gutter = `${num} │ `;
-  const contentBudget = Math.max(1, maxCols - gutter.length);
-
-  if (cursorCol === null) {
-    const shown = line.length > contentBudget ? line.slice(0, contentBudget - 1) + '…' : line;
-    return (
-      <Text wrap="truncate">
-        <Text dimColor>{gutter}</Text>
-        {shown.length === 0 ? ' ' : shown}
-      </Text>
-    );
-  }
-
-  let scrollX = 0;
-  if (cursorCol >= contentBudget) scrollX = cursorCol - contentBudget + 1;
-  const visibleLine = line.slice(scrollX, scrollX + contentBudget);
-  const visibleCursor = cursorCol - scrollX;
-
-  const before = visibleLine.slice(0, visibleCursor);
-  const cursorChar = visibleLine[visibleCursor] ?? ' ';
-  const after = visibleLine.slice(visibleCursor + 1);
-
-  return (
-    <Text wrap="truncate">
-      <Text color="cyan">{gutter}</Text>
-      <Text>{before}</Text>
-      <Text inverse>{cursorChar}</Text>
-      <Text>{after}</Text>
-    </Text>
   );
 };

@@ -6,14 +6,15 @@ schemas and tables with arrow keys, view rows, and run ad-hoc SQL.
 ## Requirements
 
 - Node.js >= 20
-- On Linux, the `libsecret` runtime library (used by `keytar` for the OS keyring):
+- On Linux, the `libsecret` runtime is used to talk to the GNOME / KDE keyring.
+  It's installed by default on most desktop distros; if it isn't:
 
   ```sh
   sudo apt install libsecret-1-0
   ```
 
-  If `npm install` ever needs to build keytar from source, also install
-  `libsecret-1-dev`. The prebuilt binary is normally used.
+  No build-time dev headers are required — `pgaze` uses `@napi-rs/keyring`,
+  which ships prebuilt native binaries.
 
 ## Install
 

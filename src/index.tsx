@@ -4,10 +4,9 @@ import { render } from 'ink';
 import { App } from './app.js';
 import { installKeypressDetector, uninstallKeypressDetector } from './lib/keypress.js';
 
-const ENTER_ALT_SCREEN = '\x1b[?1049h\x1b[H';
-const EXIT_ALT_SCREEN = '\x1b[?1049l';
-const HIDE_CURSOR = '\x1b[?25l';
-const SHOW_CURSOR = '\x1b[?25h';
+// Single atomic write to enter the alt-screen, home the cursor, and hide it.
+const ENTER = '\x1b[?1049h\x1b[H\x1b[?25l';
+const EXIT = '\x1b[?25h\x1b[?1049l';
 
 let restored = false;
 function restoreScreen(): void {
@@ -15,15 +14,49 @@ function restoreScreen(): void {
   restored = true;
   try {
     uninstallKeypressDetector();
-    process.stdout.write(SHOW_CURSOR + EXIT_ALT_SCREEN);
+  } catch {
+    /* ignore */
+  }
+  try {
+    process.stdout.write(EXIT);
   } catch {
     /* ignore */
   }
 }
 
-process.stdout.write(ENTER_ALT_SCREEN + HIDE_CURSOR);
-installKeypressDetector();
+// Make sure the terminal is restored even on signals or fatal errors.
 process.on('exit', restoreScreen);
+process.on('SIGINT', () => {
+  restoreScreen();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  restoreScreen();
+  process.exit(143);
+});
+process.on('SIGHUP', () => {
+  restoreScreen();
+  process.exit(129);
+});
+process.on('uncaughtException', (err) => {
+  restoreScreen();
+  // eslint-disable-next-line no-console
+  console.error('Uncaught exception:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  restoreScreen();
+  // eslint-disable-next-line no-console
+  console.error('Unhandled rejection:', reason);
+  process.exit(1);
+});
+
+if (process.stdout.isTTY) {
+  process.stdout.write(ENTER);
+} else {
+  // not a TTY (piped output) — skip the alt-screen toggle
+}
+installKeypressDetector();
 
 const ink = render(<App />, { exitOnCtrlC: true });
 ink.waitUntilExit().finally(restoreScreen);

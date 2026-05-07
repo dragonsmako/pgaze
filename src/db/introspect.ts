@@ -12,6 +12,22 @@ export function quoteIdent(name: string): string {
   return '"' + name.replace(/"/g, '""') + '"';
 }
 
+type NoticeEmitter = {
+  on(event: 'notice', listener: (n: unknown) => void): unknown;
+  off(event: 'notice', listener: (n: unknown) => void): unknown;
+};
+
+function asEmitter(c: unknown): NoticeEmitter | null {
+  if (
+    c &&
+    typeof (c as { on?: unknown }).on === 'function' &&
+    typeof (c as { off?: unknown }).off === 'function'
+  ) {
+    return c as NoticeEmitter;
+  }
+  return null;
+}
+
 export async function listSchemas(conn: Connection): Promise<string[]> {
   return withClient(conn, async (c) => {
     const res = await c.query<{ schema_name: string }>(
@@ -84,9 +100,6 @@ export async function listAllObjects(conn: Connection): Promise<AllObject[]> {
   });
 }
 
-// Backwards-compat alias (kept temporarily; new code should call listAllObjects)
-export const listAllTables = listAllObjects;
-
 const TABLE_KIND: Record<string, string> = {
   r: 'TABLE',
   p: 'PARTITIONED TABLE',
@@ -98,34 +111,34 @@ const VIEW_KIND: Record<string, string> = {
   m: 'MATERIALIZED VIEW',
 };
 
-export async function listTables(conn: Connection, schema: string): Promise<TableInfo[]> {
+async function listRelations(
+  conn: Connection,
+  schema: string,
+  relkinds: readonly string[],
+  labelMap: Record<string, string>,
+  fallback: string,
+): Promise<TableInfo[]> {
   return withClient(conn, async (c) => {
+    const placeholders = relkinds.map((_, i) => `$${i + 2}`).join(',');
     const res = await c.query<{ name: string; relkind: string }>(
       `SELECT c.relname AS name, c.relkind::text AS relkind
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = $1
-          AND c.relkind IN ('r','p','f')
+          AND c.relkind IN (${placeholders})
         ORDER BY lower(c.relname), c.relname`,
-      [schema],
+      [schema, ...relkinds],
     );
-    return res.rows.map((r) => ({ name: r.name, kind: TABLE_KIND[r.relkind] ?? 'TABLE' }));
+    return res.rows.map((r) => ({ name: r.name, kind: labelMap[r.relkind] ?? fallback }));
   });
 }
 
-export async function listViews(conn: Connection, schema: string): Promise<TableInfo[]> {
-  return withClient(conn, async (c) => {
-    const res = await c.query<{ name: string; relkind: string }>(
-      `SELECT c.relname AS name, c.relkind::text AS relkind
-         FROM pg_class c
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1
-          AND c.relkind IN ('v','m')
-        ORDER BY lower(c.relname), c.relname`,
-      [schema],
-    );
-    return res.rows.map((r) => ({ name: r.name, kind: VIEW_KIND[r.relkind] ?? 'VIEW' }));
-  });
+export function listTables(conn: Connection, schema: string): Promise<TableInfo[]> {
+  return listRelations(conn, schema, ['r', 'p', 'f'], TABLE_KIND, 'TABLE');
+}
+
+export function listViews(conn: Connection, schema: string): Promise<TableInfo[]> {
+  return listRelations(conn, schema, ['v', 'm'], VIEW_KIND, 'VIEW');
 }
 
 export async function listRoutines(conn: Connection, schema: string): Promise<RoutineInfo[]> {
@@ -197,16 +210,76 @@ export async function fetchRows(
   });
 }
 
+export type CountResult = {
+  exact: number | null;     // null when we declined an exact scan
+  estimate: number | null;  // pg_class.reltuples (-1 → never analyzed → null)
+};
+
+// Fast estimate via the planner stats. Constant time.
+export async function estimateRowCount(
+  conn: Connection,
+  schema: string,
+  table: string,
+): Promise<number | null> {
+  return withClient(conn, async (c) => {
+    const res = await c.query<{ reltuples: string }>(
+      `SELECT reltuples::bigint::text AS reltuples
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2`,
+      [schema, table],
+    );
+    const raw = res.rows[0]?.reltuples;
+    if (raw === undefined || raw === null) return null;
+    const n = parseBigIntCount(raw);
+    if (n === null || n < 0) return null; // -1 means "never analysed"
+    return n;
+  });
+}
+
+// Exact count(*). Slow on huge tables; call only when the user asks.
+export async function exactRowCount(
+  conn: Connection,
+  schema: string,
+  table: string,
+): Promise<number | null> {
+  return withClient(conn, async (c) => {
+    const sql = `SELECT count(*)::bigint::text AS n FROM ${quoteIdent(schema)}.${quoteIdent(table)}`;
+    const res = await c.query<{ n: string }>(sql);
+    return parseBigIntCount(res.rows[0]?.n ?? '0');
+  });
+}
+
+function parseBigIntCount(raw: string): number | null {
+  // pg returns bigint as a string. Reject anything that isn't an integer.
+  if (!/^-?\d+$/.test(raw)) return null;
+  // Within JS safe int range we can use Number; otherwise return MAX_SAFE.
+  try {
+    const big = BigInt(raw);
+    if (big > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+    if (big < BigInt(Number.MIN_SAFE_INTEGER)) return Number.MIN_SAFE_INTEGER;
+    return Number(big);
+  } catch {
+    return null;
+  }
+}
+
+// Backwards compatibility: existing callers expect a single `Promise<number>`.
+// Now returns the estimate when fast and falls back to exact for small tables.
+import { COUNT_ESTIMATE_EXACT_BELOW } from '../config/uiConstants.js';
 export async function countRows(
   conn: Connection,
   schema: string,
   table: string,
-): Promise<number> {
-  return withClient(conn, async (c) => {
-    const sql = `SELECT count(*)::bigint AS n FROM ${quoteIdent(schema)}.${quoteIdent(table)}`;
-    const res = await c.query<{ n: string }>(sql);
-    return Number(res.rows[0]?.n ?? 0);
-  });
+): Promise<{ value: number; isEstimate: boolean }> {
+  const est = await estimateRowCount(conn, schema, table);
+  if (est !== null && est >= COUNT_ESTIMATE_EXACT_BELOW) {
+    return { value: est, isEstimate: true };
+  }
+  const exact = await exactRowCount(conn, schema, table);
+  if (exact !== null) return { value: exact, isEstimate: false };
+  // both failed; fall back to a zero estimate
+  return { value: est ?? 0, isEstimate: true };
 }
 
 export async function runQuery(
@@ -216,7 +289,10 @@ export async function runQuery(
 ): Promise<QueryResult> {
   return withClient(conn, async (c) => {
     const notices: NoticeMessage[] = [];
-    // pg's PoolClient is an EventEmitter that forwards 'notice' from the underlying connection.
+    // pg's PoolClient is an EventEmitter that forwards 'notice' from the
+    // underlying connection. We narrow at runtime via a structural check
+    // rather than asserting through `unknown` blindly.
+    const emitter = asEmitter(c);
     const onNotice = (raw: unknown) => {
       const n = (raw ?? {}) as {
         severity?: string;
@@ -231,11 +307,7 @@ export async function runQuery(
         ...(n.hint ? { hint: n.hint } : {}),
       });
     };
-    const emitter = c as unknown as {
-      on(ev: string, cb: (n: unknown) => void): void;
-      off(ev: string, cb: (n: unknown) => void): void;
-    };
-    emitter.on('notice', onNotice);
+    if (emitter) emitter.on('notice', onNotice);
     try {
       const cfg = values && values.length > 0
         ? { text: sql, rowMode: 'array' as const, values }
@@ -260,7 +332,7 @@ export async function runQuery(
         ...(res.command ? { command: res.command } : {}),
       };
     } finally {
-      emitter.off('notice', onNotice);
+      if (emitter) emitter.off('notice', onNotice);
     }
   });
 }

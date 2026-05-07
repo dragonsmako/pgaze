@@ -5,6 +5,7 @@ import type { Connection } from '../db/client.js';
 import { countRows, fetchRows } from '../db/introspect.js';
 import type { QueryResult } from '../types.js';
 import { DataGrid, type GridCursor, type GridSort } from './DataGrid.js';
+import { OSC52_MAX_PAYLOAD } from '../config/uiConstants.js';
 
 type Selection = { schema: string; table: string } | null;
 
@@ -32,16 +33,27 @@ function formatForClipboard(value: unknown): string {
   return String(value);
 }
 
-function copyToClipboard(text: string): void {
+type CopyOutcome =
+  | { ok: true; bytes: number }
+  | { ok: false; reason: string };
+
+function copyToClipboard(text: string): CopyOutcome {
   const b64 = Buffer.from(text, 'utf8').toString('base64');
+  if (b64.length > OSC52_MAX_PAYLOAD) {
+    return {
+      ok: false,
+      reason: `value too large to copy (${Math.round(text.length / 1024)} KB)`,
+    };
+  }
   process.stdout.write(`\x1b]52;c;${b64}\x07`);
+  return { ok: true, bytes: text.length };
 }
 
 export const TablePane: React.FC<Props> = ({ conn, selection, focused, maxCols, maxRows }) => {
   const pageSize = Math.max(5, maxRows - 5);
   const [page, setPage] = useState(0);
   const [data, setData] = useState<QueryResult | null>(null);
-  const [total, setTotal] = useState<number | null>(null);
+  const [total, setTotal] = useState<{ value: number; isEstimate: boolean } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<GridSort | null>(null);
@@ -124,9 +136,13 @@ export const TablePane: React.FC<Props> = ({ conn, selection, focused, maxCols, 
     const value = data.rows[cursor.row]?.[cursor.col];
     const text = formatForClipboard(value);
     try {
-      copyToClipboard(text);
-      const preview = text.length > 24 ? text.slice(0, 21) + '…' : text;
-      setCopyMsg(`Copied: ${preview || '(empty)'}`);
+      const outcome = copyToClipboard(text);
+      if (outcome.ok) {
+        const preview = text.length > 24 ? text.slice(0, 21) + '…' : text;
+        setCopyMsg(`Copied: ${preview || '(empty)'}`);
+      } else {
+        setCopyMsg(outcome.reason);
+      }
     } catch {
       setCopyMsg('Copy failed');
     }
@@ -183,7 +199,7 @@ export const TablePane: React.FC<Props> = ({ conn, selection, focused, maxCols, 
         return;
       }
       if (input === 'n') {
-        if (total === null || (page + 1) * pageSize < total) {
+        if (total === null || (page + 1) * pageSize < total.value) {
           setPage((p) => p + 1);
           setCursor((c) => ({ ...c, row: 0 }));
         }
@@ -231,7 +247,8 @@ export const TablePane: React.FC<Props> = ({ conn, selection, focused, maxCols, 
 
   const start = page * pageSize + 1;
   const end = page * pageSize + data.rows.length;
-  const totalLabel = total === null ? '?' : String(total);
+  const totalLabel =
+    total === null ? '?' : `${total.isEstimate ? '~' : ''}${total.value}`;
   const currentColName = data.columns[cursor.col] ?? '';
   const sortLabel = sort ? `sort: ${sort.column} ${sort.dir}` : 'no sort';
 
