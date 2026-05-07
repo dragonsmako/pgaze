@@ -23,25 +23,35 @@ type TableNode = {
 };
 
 type FlatItem =
-  | { kind: 'schema'; depth: 0; schema: SchemaNode; index: number }
-  | { kind: 'schema-loading'; depth: 1; schema: SchemaNode; index: number }
-  | { kind: 'schema-error'; depth: 1; schema: SchemaNode; index: number }
-  | { kind: 'table'; depth: 1; schema: SchemaNode; table: TableNode; tableIndex: number; index: number }
-  | { kind: 'table-loading'; depth: 2; schema: SchemaNode; table: TableNode; index: number }
-  | { kind: 'table-error'; depth: 2; schema: SchemaNode; table: TableNode; index: number }
-  | { kind: 'column'; depth: 2; schema: SchemaNode; table: TableNode; column: ColumnInfo; index: number };
+  | { kind: 'schema'; depth: 0; schema: SchemaNode }
+  | { kind: 'schema-loading'; depth: 1; schema: SchemaNode }
+  | { kind: 'schema-error'; depth: 1; schema: SchemaNode }
+  | { kind: 'table'; depth: 1; schema: SchemaNode; table: TableNode }
+  | { kind: 'table-loading'; depth: 2; schema: SchemaNode; table: TableNode }
+  | { kind: 'table-error'; depth: 2; schema: SchemaNode; table: TableNode }
+  | { kind: 'column'; depth: 2; schema: SchemaNode; table: TableNode; column: ColumnInfo };
 
 type Props = {
   conn: Connection;
   focused: boolean;
+  maxCols: number;
+  maxRows: number;
   onSelectTable: (schema: string, table: string) => void;
 };
 
-export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
+function truncate(s: string, width: number): string {
+  if (width <= 0) return '';
+  if (s.length <= width) return s;
+  if (width <= 1) return '…';
+  return s.slice(0, width - 1) + '…';
+}
+
+export const Tree: React.FC<Props> = ({ conn, focused, maxCols, maxRows, onSelectTable }) => {
   const [schemas, setSchemas] = useState<SchemaNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [topError, setTopError] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
+  const [scroll, setScroll] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,37 +76,23 @@ export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
 
   const flat: FlatItem[] = [];
   schemas.forEach((schema) => {
-    flat.push({ kind: 'schema', depth: 0, schema, index: flat.length });
+    flat.push({ kind: 'schema', depth: 0, schema });
     if (schema.expanded) {
       if (schema.loading) {
-        flat.push({ kind: 'schema-loading', depth: 1, schema, index: flat.length });
+        flat.push({ kind: 'schema-loading', depth: 1, schema });
       } else if (schema.error) {
-        flat.push({ kind: 'schema-error', depth: 1, schema, index: flat.length });
+        flat.push({ kind: 'schema-error', depth: 1, schema });
       } else if (schema.tables) {
-        schema.tables.forEach((table, tableIndex) => {
-          flat.push({
-            kind: 'table',
-            depth: 1,
-            schema,
-            table,
-            tableIndex,
-            index: flat.length,
-          });
+        schema.tables.forEach((table) => {
+          flat.push({ kind: 'table', depth: 1, schema, table });
           if (table.expanded) {
             if (table.loading) {
-              flat.push({ kind: 'table-loading', depth: 2, schema, table, index: flat.length });
+              flat.push({ kind: 'table-loading', depth: 2, schema, table });
             } else if (table.error) {
-              flat.push({ kind: 'table-error', depth: 2, schema, table, index: flat.length });
+              flat.push({ kind: 'table-error', depth: 2, schema, table });
             } else if (table.columns) {
               table.columns.forEach((column) => {
-                flat.push({
-                  kind: 'column',
-                  depth: 2,
-                  schema,
-                  table,
-                  column,
-                  index: flat.length,
-                });
+                flat.push({ kind: 'column', depth: 2, schema, table, column });
               });
             }
           }
@@ -106,7 +102,31 @@ export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
   });
 
   const safeCursor = flat.length === 0 ? 0 : Math.min(cursor, flat.length - 1);
-  const current = flat[safeCursor];
+
+  // header (1) + optional ▲ (1) + optional ▼ (1) + items
+  const headerRows = 2; // "Schemas" + blank line
+  const viewport = Math.max(1, maxRows - headerRows - 2); // -2 for indicator rows
+  const safeScroll = Math.max(
+    0,
+    Math.min(scroll, Math.max(0, flat.length - viewport)),
+  );
+
+  // keep cursor in view
+  useEffect(() => {
+    setScroll((prev) => {
+      let next = prev;
+      if (safeCursor < next) next = safeCursor;
+      else if (safeCursor >= next + viewport) next = safeCursor - viewport + 1;
+      const max = Math.max(0, flat.length - viewport);
+      if (next > max) next = max;
+      if (next < 0) next = 0;
+      return next;
+    });
+  }, [safeCursor, viewport, flat.length]);
+
+  const visible = flat.slice(safeScroll, safeScroll + viewport);
+  const hasAbove = safeScroll > 0;
+  const hasBelow = safeScroll + viewport < flat.length;
 
   function updateSchema(name: string, patch: Partial<SchemaNode>): void {
     setSchemas((prev) =>
@@ -168,8 +188,10 @@ export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
     }
   }
 
+  const current = flat[safeCursor];
+
   useInput(
-    (input, key) => {
+    (_input, key) => {
       if (flat.length === 0) return;
 
       if (key.upArrow) {
@@ -178,6 +200,14 @@ export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
       }
       if (key.downArrow) {
         setCursor((c) => Math.min(flat.length - 1, c + 1));
+        return;
+      }
+      if (key.pageUp) {
+        setCursor((c) => Math.max(0, c - viewport));
+        return;
+      }
+      if (key.pageDown) {
+        setCursor((c) => Math.min(flat.length - 1, c + viewport));
         return;
       }
 
@@ -234,31 +264,52 @@ export const Tree: React.FC<Props> = ({ conn, focused, onSelectTable }) => {
   if (topError) {
     return (
       <Box flexDirection="column" padding={1}>
-        <Text color="red">{topError}</Text>
+        <Text color="red">{truncate(topError, Math.max(8, maxCols - 2))}</Text>
       </Box>
     );
   }
 
+  // available width for label (after arrow ' ', indent, icon ' ')
+  const lineWidth = Math.max(8, maxCols - 1); // -1 padding-x
+
   return (
-    <Box flexDirection="column" paddingX={1} paddingY={0}>
-      <Box marginBottom={1}>
+    <Box flexDirection="column" paddingX={1}>
+      <Box>
         <Text bold color={focused ? 'cyan' : undefined}>
-          {focused ? '▸ ' : '  '}Schemas
+          Schemas{' '}
+          <Text dimColor>
+            ({safeCursor + (flat.length === 0 ? 0 : 1)}/{flat.length})
+          </Text>
         </Text>
+      </Box>
+      <Box height={1}>
+        {hasAbove ? <Text dimColor>▲ {safeScroll} more</Text> : <Text> </Text>}
       </Box>
       {flat.length === 0 ? (
         <Text dimColor>No schemas.</Text>
       ) : (
-        flat.map((item, i) => {
-          const sel = i === safeCursor && focused;
-          return <Row key={i} item={item} selected={sel} />;
+        visible.map((item, i) => {
+          const realIndex = safeScroll + i;
+          const sel = realIndex === safeCursor && focused;
+          return <Row key={realIndex} item={item} selected={sel} maxWidth={lineWidth} />;
         })
       )}
+      <Box height={1}>
+        {hasBelow ? (
+          <Text dimColor>▼ {flat.length - (safeScroll + viewport)} more</Text>
+        ) : (
+          <Text> </Text>
+        )}
+      </Box>
     </Box>
   );
 };
 
-const Row: React.FC<{ item: FlatItem; selected: boolean }> = ({ item, selected }) => {
+const Row: React.FC<{ item: FlatItem; selected: boolean; maxWidth: number }> = ({
+  item,
+  selected,
+  maxWidth,
+}) => {
   const indent = '  '.repeat(item.depth);
   const arrow = selected ? '▸' : ' ';
   let icon = ' ';
@@ -270,7 +321,6 @@ const Row: React.FC<{ item: FlatItem; selected: boolean }> = ({ item, selected }
     icon = item.schema.expanded ? '▾' : '▸';
     label = item.schema.name;
   } else if (item.kind === 'schema-loading') {
-    icon = ' ';
     label = 'loading…';
     dim = true;
   } else if (item.kind === 'schema-error') {
@@ -282,7 +332,6 @@ const Row: React.FC<{ item: FlatItem; selected: boolean }> = ({ item, selected }
     const isView = item.table.kind !== 'BASE TABLE';
     label = item.table.name + (isView ? ` (${item.table.kind.toLowerCase()})` : '');
   } else if (item.kind === 'table-loading') {
-    icon = ' ';
     label = 'loading…';
     dim = true;
   } else if (item.kind === 'table-error') {
@@ -295,9 +344,14 @@ const Row: React.FC<{ item: FlatItem; selected: boolean }> = ({ item, selected }
     dim = true;
   }
 
+  // build the line and clip to one terminal line
+  const prefix = `${arrow} ${indent}${icon} `;
+  const labelBudget = Math.max(1, maxWidth - prefix.length);
+  const line = prefix + truncate(label, labelBudget);
+
   return (
-    <Text color={selected ? 'green' : color} dimColor={dim && !selected}>
-      {arrow} {indent}{icon} {label}
+    <Text color={selected ? 'green' : color} dimColor={dim && !selected} wrap="truncate">
+      {line}
     </Text>
   );
 };

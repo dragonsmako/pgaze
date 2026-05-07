@@ -64,6 +64,8 @@ export const ConnectedView: React.FC<Props> = ({ conn, onBack }) => {
           <Tree
             conn={conn}
             focused={focus === 'tree'}
+            maxCols={leftWidth - 2}
+            maxRows={innerHeight - 2}
             onSelectTable={(schema, table) => {
               setSelection({ schema, table });
               setPane('table');
