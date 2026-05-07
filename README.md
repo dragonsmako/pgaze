@@ -1,4 +1,4 @@
-# pgaze
+## pgaze
 
 A terminal UI for browsing PostgreSQL databases. Manage saved servers, navigate
 schemas and tables with arrow keys, view rows, and run ad-hoc SQL.
